@@ -97,7 +97,7 @@ f_calc_dynamic_tpsl1(bool is_for_long, float lr_h, float lr_l, float lr_height_v
     final_tpsl
 
 f_build_signal_payload(string trade_type, string direction, float entry, float tp, float sl) =>
-    '{' + '"asset_name": "'   + asset_name + '",' +'"asset_type": "'   + asset_type_for_topic + '",' +'"symbol": "'       + syminfo.ticker + '",' +'"image_url": "' + asset_image_url + '",' +'"trade_type": "' + trade_type + '",' +'"direction": "'    + direction + '",' +'"entry_price": '   + str.tostring(entry, '#.#####') + ',' + '"take_profit": '   + str.tostring(tp, '#.#####') + ',' +'"stop_loss": '     + str.tostring(sl, '#.#####') + ',' +'"timeframe": "'    + timeframe.period + '"' +'}'
+    '{' + '"asset_name": "'   + asset_name + '",' +'"asset_type": "'   + asset_type_for_topic + '",' +'"symbol": "' + syminfo.ticker + '",' +'"image_url": "' + asset_image_url + '",' +'"trade_type": "' + trade_type + '",' +'"direction": "' + direction + '",' +'"entry_price": '   + str.tostring(entry, '#.#####') + ',' + '"take_profit": '   + str.tostring(tp, '#.#####') + ',' +'"stop_loss": ' + str.tostring(sl, '#.#####') + ',' +'"timeframe": "'  + timeframe.period + '"' +'}'
 
 // === VARIABLES & INDICATORS ===
 var float active_lr_high    = na
