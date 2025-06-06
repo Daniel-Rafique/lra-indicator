@@ -1,5 +1,5 @@
 //@version=6
-strategy("LRA MM Strategy v2.5 (Fixed)",
+strategy("LRA MM Strategy v2.5 (Direct Webhook)",
      overlay=true,
      initial_capital=10000,
      commission_value=0.01,
@@ -22,7 +22,6 @@ lr_min_bars_consolidation   = input.int(5,  "LR Min Bars in Consolidation", minv
 lr_min_height_atr           = input.float(0.5, "LR Min Height (ATR multiples)", minval=0.1, step=0.1, group=GRP_LR, tooltip="Minimum height of the LR relative to ATR.")
 lr_max_height_atr           = input.float(3.0, "LR Max Height (ATR multiples)", minval=0.1, step=0.1, group=GRP_LR, tooltip="Maximum height of the LR relative to ATR.")
 lr_breakout_confirmation_atr = input.float(0.1, "LR Breakout Confirmation (ATR multiples)", minval=0.0, step=0.05, group=GRP_LR, tooltip="How far price must close beyond LR boundary for standard breakout confirmation.")
-
 // Dynamic TPSL & False Breakout
 tpsl1_swing_lookback        = input.int(30, "TPSL1 Swing H/L Lookback", minval=5, group=GRP_TPSL, tooltip="Bars to look back for prior swing high/low for TPSL1.")
 tpsl1_use_lr_height_projection = input.bool(true, "TPSL1 Use LR Height Projection?", group=GRP_TPSL, tooltip="Use LR height projection for one method of TPSL1 calculation.")
@@ -30,86 +29,45 @@ tpsl1_lr_height_multiplier  = input.float(1.0, "TPSL1 LR Height Multiplier", min
 enable_false_breakout_entries = input.bool(true, "Enable False Breakout Entries?", group=GRP_TPSL, tooltip="Trade on TPSL Level False Breakout patterns.")
 fb_max_penetration_pct_lr   = input.float(20.0, "FB Max Penetration (% of LR Height)", minval=1.0, maxval=50.0, step=1.0, group=GRP_TPSL, tooltip="Max penetration beyond LR boundary for it to be considered a False Breakout (FB). LRA suggests <20%.")
 fb_return_bars              = input.int(1, "FB Price Return Bars", minval=1, maxval=3, group=GRP_TPSL, tooltip="Max bars for price to return inside LR after a false poke to trigger FB trade.")
-
 // Volume & Imbalance
 use_volume_confirmation     = input.bool(true, "Use Volume Confirmation (Standard & FB)?", group=GRP_VOL, tooltip="Enable/disable volume filter for breakouts.")
 volume_ma_period            = input.int(20, "Volume MA Period", minval=1, group=GRP_VOL, tooltip="Moving average period for volume.")
 volume_threshold_factor_std = input.float(1.5, "Max Breakout Vol Factor (Standard)", group=GRP_VOL, tooltip="For Standard Breakouts: volume < avgVolume * factor.")
 volume_threshold_factor_fb  = input.float(1.0, "Max Breakout Vol Factor (False Breakout)", group=GRP_VOL, tooltip="For FBs: volume < avgVolume * factor.")
-
 // Risk & Position Sizing
 risk_percent                = input.float(1.0, "Risk per Trade (% of Equity)", minval=0.1, maxval=10.0, step=0.1, group=GRP_RISK, tooltip="Percentage of equity to risk on a single trade.")
 sl_buffer_atr               = input.float(0.2, "SL Buffer (ATR multiples from LR boundary/FB extreme)", minval=0.0, step=0.1, group=GRP_RISK, tooltip="Additional buffer for stop loss.")
-
 // Session Filter
 use_session_filter          = input.bool(false, "Use Session Filter?", group=GRP_SESSION, tooltip="Enable/disable trading session filter.")
 trade_session               = input.session("0930-1600", "Trading Session (Exchange Timezone)", group=GRP_SESSION, tooltip="Define the trading session.")
-
 // Alerts
-enable_long_alerts          = input.bool(true, "Enable Long Entry Alerts?", group=GRP_ALERTS)
-enable_short_alerts         = input.bool(true, "Enable Short Entry Alerts?", group=GRP_ALERTS)
-
-// === VARIABLES ===
-// LR State
-var float active_lr_high    = na
-var float active_lr_low     = na
-var int   active_lr_start_bar = na
-var float active_lr_height  = na
-var bool  in_potential_lr   = false
-
-// Dynamic TPSL State
-var float dynamic_tpsl1_for_long_trade  = na // Calculated TP if a long from standard breakout is taken
-var float dynamic_tpsl1_for_short_trade = na // Calculated TP if a short from standard breakout is taken
-
-// False Breakout State
-var bool  is_monitoring_fb_up   = false // Potential false break above LR high → short
-var float fb_up_trigger_high    = na    // High of bar that poked above LR
-var int   fb_up_trigger_bar     = na
-var bool  is_monitoring_fb_down = false // Potential false break below LR low → long
-var float fb_down_trigger_low   = na    // Low of bar that poked below LR
-var int   fb_down_trigger_bar   = na
-
-// Trade State (for plotting SL/TP)
-var float sl_price_var        = na
-var float tp_price_var        = na
-
-// Plotting State for LR Box
-var float plot_lr_h           = na
-var float plot_lr_l           = na
-var int   plot_lr_start_time  = na // Storing time now, not bar_index
-var color plot_lr_color       = na
-var string plot_lr_text       = ""
-var bool  new_lr_for_plot     = false
-
-// === INDICATORS ===
-atr_val    = ta.atr(14)
-avg_volume = ta.sma(volume, volume_ma_period)
-
-// === PRE-CALCULATE PIVOTS & SWING CANDIDATES (every bar) ===
-swing_high_candidate = ta.highest(high, tpsl1_swing_lookback)[1]
-swing_low_candidate  = ta.lowest(low,  tpsl1_swing_lookback)[1]
+webhook_url          = input.string("", "Your Server Webhook URL", group=GRP_ALERTS, tooltip="The endpoint on your server that will receive the trade signal JSON.")
+asset_name           = input.string("Bitcoin", "Asset Name", group=GRP_ALERTS, tooltip="e.g., Bitcoin, Ethereum")
+asset_image_url      = input.string("https://s3.tradingview.com/userpics/622435-wsSp_orig.png", "Asset Image URL", group=GRP_ALERTS, tooltip="A URL for an image/logo of the asset.")
+asset_type_for_topic = input.string("CRYPTO", "Asset Type (for Topic/Channel)", group=GRP_ALERTS, tooltip="e.g., CRYPTO, FX, STOCKS. Used by your server to route the message.")
 
 // === FUNCTIONS ===
+// FIX: Meticulously corrected indentation and structure for all functions.
 f_calc_position_size(float entry_price, float sl_price) =>
-    float risk_per_share = math.abs(entry_price - sl_price)
-    float risk_amount    = strategy.equity * (risk_percent / 100)
-    float qty            = risk_per_share > 0 ? (risk_amount / risk_per_share) : 0.0
+    risk_per_share = math.abs(entry_price - sl_price)
+    risk_amount = strategy.equity * (risk_percent / 100)
+    qty = risk_per_share > 0 ? (risk_amount / risk_per_share) : 0.0
     qty > 0 ? qty : na
 
 f_calc_dynamic_tpsl1(bool is_for_long, float lr_h, float lr_l, float lr_height_val, float swing_high, float swing_low) =>
-    float tpsl_swing         = na
+    float tpsl_swing = na
     float tpsl_lr_projection = na
-    float final_tpsl         = na
+    float final_tpsl = na
     if is_for_long
         bool is_sig_swing = false
         if not na(swing_high) and swing_high > lr_h
             is_sig_swing := true
-            for i = 1 to tpsl1_swing_lookback - 1
-                if high[i] > swing_high
-                    is_sig_swing := false
-                    break
-            if is_sig_swing
-                tpsl_swing := swing_high
+        for i = 1 to tpsl1_swing_lookback - 1
+            if high[i] > swing_high
+                is_sig_swing := false
+                break
+        if is_sig_swing
+            tpsl_swing := swing_high
         if tpsl1_use_lr_height_projection and not na(lr_height_val)
             tpsl_lr_projection := lr_h + (lr_height_val * tpsl1_lr_height_multiplier)
         if not na(tpsl_swing) and not na(tpsl_lr_projection)
@@ -122,12 +80,12 @@ f_calc_dynamic_tpsl1(bool is_for_long, float lr_h, float lr_l, float lr_height_v
         bool is_sig_swing2 = false
         if not na(swing_low) and swing_low < lr_l
             is_sig_swing2 := true
-            for i = 1 to tpsl1_swing_lookback - 1
-                if low[i] < swing_low
-                    is_sig_swing2 := false
-                    break
-            if is_sig_swing2
-                tpsl_swing := swing_low
+        for i = 1 to tpsl1_swing_lookback - 1
+            if low[i] < swing_low
+                is_sig_swing2 := false
+                break
+        if is_sig_swing2
+            tpsl_swing := swing_low
         if tpsl1_use_lr_height_projection and not na(lr_height_val)
             tpsl_lr_projection := lr_l - (lr_height_val * tpsl1_lr_height_multiplier)
         if not na(tpsl_swing) and not na(tpsl_lr_projection)
@@ -138,57 +96,77 @@ f_calc_dynamic_tpsl1(bool is_for_long, float lr_h, float lr_l, float lr_height_v
             final_tpsl := tpsl_lr_projection
     final_tpsl
 
-// === MAIN LOGIC ===
+f_build_signal_payload(string trade_type, string direction, float entry, float tp, float sl) =>
+    '{' + '"asset_name": "'   + asset_name + '",' +'"asset_type": "'   + asset_type_for_topic + '",' +'"symbol": "'       + syminfo.ticker + '",' +'"image_url": "' + asset_image_url + '",' +'"trade_type": "' + trade_type + '",' +'"direction": "'    + direction + '",' +'"entry_price": '   + str.tostring(entry, '#.#####') + ',' + '"take_profit": '   + str.tostring(tp, '#.#####') + ',' +'"stop_loss": '     + str.tostring(sl, '#.#####') + ',' +'"timeframe": "'    + timeframe.period + '"' +'}'
 
-// Pre-calc dynamic TPSL1 values on every bar
-dynamic_tpsl1_for_long_trade  := f_calc_dynamic_tpsl1(true,  active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
-dynamic_tpsl1_for_short_trade := f_calc_dynamic_tpsl1(false, active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
-
-// FIX: Moved ta.highest/lowest out of the 'if' block to execute on every bar for consistency.
+// === VARIABLES & INDICATORS ===
+var float active_lr_high    = na
+var float active_lr_low     = na
+var int   active_lr_start_bar = na
+var float active_lr_height  = na
+var bool  in_potential_lr   = false
+var float dynamic_tpsl1_for_long_trade  = na
+var float dynamic_tpsl1_for_short_trade = na
+var bool  is_monitoring_fb_up   = false
+var float fb_up_trigger_high    = na
+var int   fb_up_trigger_bar     = na
+var bool  is_monitoring_fb_down = false
+var float fb_down_trigger_low   = na
+var int   fb_down_trigger_bar   = na
+var float sl_price_var        = na
+var float tp_price_var        = na
+var float plot_lr_h           = na
+var float plot_lr_l           = na
+var int   plot_lr_start_time  = na
+var color plot_lr_color       = na
+var string plot_lr_text       = ""
+var bool  new_lr_for_plot     = false
+atr_val    = ta.atr(14)
+avg_volume = ta.sma(volume, volume_ma_period)
+swing_high_candidate = ta.highest(high, tpsl1_swing_lookback)[1]
+swing_low_candidate  = ta.lowest(low,  tpsl1_swing_lookback)[1]
 float potential_lr_h_candidate = ta.highest(high, lr_detect_lookback)[1]
 float potential_lr_l_candidate = ta.lowest(low,  lr_detect_lookback)[1]
 
-// --- Reset False Breakout monitoring flags ---
+// === MAIN LOGIC ===
+dynamic_tpsl1_for_long_trade  := f_calc_dynamic_tpsl1(true,  active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
+dynamic_tpsl1_for_short_trade := f_calc_dynamic_tpsl1(false, active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
+
 if strategy.position_size != 0 or not in_potential_lr
-    is_monitoring_fb_up   := false
+    is_monitoring_fb_up := false
     is_monitoring_fb_down := false
 
-// --- Step 1: Locked-in Range Detection ---
 if not in_potential_lr and strategy.position_size == 0
-    float potential_lr_h        = potential_lr_h_candidate
-    float potential_lr_l        = potential_lr_l_candidate
+    float potential_lr_h = potential_lr_h_candidate
+    float potential_lr_l = potential_lr_l_candidate
     float potential_lr_height_val = potential_lr_h - potential_lr_l
     bool is_height_valid = (potential_lr_height_val >= lr_min_height_atr * atr_val) and (potential_lr_height_val <= lr_max_height_atr * atr_val)
-
     if is_height_valid and potential_lr_height_val > 0
         int bars_in_range = 0
         for i = 0 to lr_min_bars_consolidation - 1
             if high[i] <= potential_lr_h and low[i] >= potential_lr_l
                 bars_in_range += 1
-
         if bars_in_range >= lr_min_bars_consolidation
-            active_lr_high      := potential_lr_h
-            active_lr_low       := potential_lr_l
-            active_lr_height    := potential_lr_height_val
+            active_lr_high := potential_lr_h
+            active_lr_low := potential_lr_l
+            active_lr_height := potential_lr_height_val
             active_lr_start_bar := bar_index
-            in_potential_lr     := true
-
-            plot_lr_h       := active_lr_high
-            plot_lr_l       := active_lr_low
+            in_potential_lr := true
+            plot_lr_h := active_lr_high
+            plot_lr_l := active_lr_low
             plot_lr_start_time := time[bar_index - active_lr_start_bar + lr_min_bars_consolidation - 1]
-            plot_lr_color   := color.new(color.gray, 70)
-            plot_lr_text    := "Potential LR"
+            plot_lr_color := color.new(color.gray, 70)
+            plot_lr_text := "Potential LR"
             new_lr_for_plot := true
 
-// --- Step 2: Breakout / False Breakout Check ---
 if in_potential_lr and strategy.position_size == 0
-    float breakout_margin       = lr_breakout_confirmation_atr * atr_val
-    float long_breakout_level   = active_lr_high + breakout_margin
-    float short_breakout_level  = active_lr_low - breakout_margin
-    bool is_std_long_breakout  = close > long_breakout_level
+    float breakout_margin = lr_breakout_confirmation_atr * atr_val
+    float long_breakout_level = active_lr_high + breakout_margin
+    float short_breakout_level = active_lr_low - breakout_margin
+    bool is_std_long_breakout = close > long_breakout_level
     bool is_std_short_breakout = close < short_breakout_level
     bool vol_cond_std_breakout = not use_volume_confirmation or (volume < avg_volume * volume_threshold_factor_std)
-    bool vol_cond_fb_breakout  = not use_volume_confirmation or (volume < avg_volume * volume_threshold_factor_fb)
+    bool vol_cond_fb_breakout = not use_volume_confirmation or (volume < avg_volume * volume_threshold_factor_fb)
     time_in_session = time(timeframe.period, trade_session)
     bool session_condition_met = not use_session_filter or not na(time_in_session)
 
@@ -196,55 +174,50 @@ if in_potential_lr and strategy.position_size == 0
         float max_fb_penetration = active_lr_height * (fb_max_penetration_pct_lr / 100)
         if (high > active_lr_high) and (high <= active_lr_high + max_fb_penetration) and not is_std_long_breakout
             if not is_monitoring_fb_up
-                is_monitoring_fb_up   := true
-                fb_up_trigger_high    := high
-                fb_up_trigger_bar     := bar_index
+                is_monitoring_fb_up := true
+                fb_up_trigger_high := high
+                fb_up_trigger_bar := bar_index
         if is_monitoring_fb_up
-            if (bar_index <= fb_up_trigger_bar + fb_return_bars) and (close < active_lr_high)
-                if vol_cond_fb_breakout
-                    float entry_price_fb_short = close
-                    float sl_price_fb_short    = fb_up_trigger_high + sl_buffer_atr * atr_val
-                    float tp_price_fb_short    = active_lr_low
-                    float pos_size_fb_short = f_calc_position_size(entry_price_fb_short, sl_price_fb_short)
-                    if not na(pos_size_fb_short) and pos_size_fb_short > 0 and not na(tp_price_fb_short) and tp_price_fb_short < entry_price_fb_short
-                        strategy.entry("LRA FB Short", strategy.short, qty=pos_size_fb_short)
-                        strategy.exit("FB Short Exit", from_entry="LRA FB Short", stop=sl_price_fb_short, limit=tp_price_fb_short)
-                        sl_price_var := sl_price_fb_short
-                        tp_price_var := tp_price_fb_short
-                        plot_lr_color := color.new(color.orange, 70)
-                        plot_lr_text  := "FB Resistance LR"
-                        new_lr_for_plot := true
-                        if enable_short_alerts
-                            alert("LRA FB Short: False break above " + str.tostring(active_lr_high) + ", C: " + str.tostring(close), alert.freq_once_per_bar_close)
-                        in_potential_lr     := false
-                        is_monitoring_fb_up := false
+            if (bar_index <= fb_up_trigger_bar + fb_return_bars) and (close < active_lr_high) and vol_cond_fb_breakout
+                float entry_price_fb_short = close
+                float sl_price_fb_short = fb_up_trigger_high + sl_buffer_atr * atr_val
+                float tp_price_fb_short = active_lr_low
+                float pos_size_fb_short = f_calc_position_size(entry_price_fb_short, sl_price_fb_short)
+                if not na(pos_size_fb_short) and pos_size_fb_short > 0 and not na(tp_price_fb_short) and tp_price_fb_short < entry_price_fb_short
+                    string alert_payload = f_build_signal_payload("False Breakout", "SHORT", entry_price_fb_short, tp_price_fb_short, sl_price_fb_short)
+                    strategy.entry("LRA FB Short", strategy.short, qty=pos_size_fb_short, alert_message=alert_payload)
+                    strategy.exit("FB Short Exit", from_entry="LRA FB Short", stop=sl_price_fb_short, limit=tp_price_fb_short)
+                    sl_price_var := sl_price_fb_short
+                    tp_price_var := tp_price_fb_short
+                    plot_lr_color := color.new(color.orange, 70)
+                    plot_lr_text  := "FB Resistance LR"
+                    new_lr_for_plot := true
+                    in_potential_lr := false
+                    is_monitoring_fb_up := false
             else if (bar_index > fb_up_trigger_bar + fb_return_bars) or is_std_long_breakout
                 is_monitoring_fb_up := false
-
         if (low < active_lr_low) and (low >= active_lr_low - max_fb_penetration) and not is_std_short_breakout
             if not is_monitoring_fb_down
-                is_monitoring_fb_down   := true
-                fb_down_trigger_low     := low
-                fb_down_trigger_bar     := bar_index
+                is_monitoring_fb_down := true
+                fb_down_trigger_low := low
+                fb_down_trigger_bar := bar_index
         if is_monitoring_fb_down
-            if (bar_index <= fb_down_trigger_bar + fb_return_bars) and (close > active_lr_low)
-                if vol_cond_fb_breakout
-                    float entry_price_fb_long = close
-                    float sl_price_fb_long    = fb_down_trigger_low - sl_buffer_atr * atr_val
-                    float tp_price_fb_long    = active_lr_high
-                    float pos_size_fb_long = f_calc_position_size(entry_price_fb_long, sl_price_fb_long)
-                    if not na(pos_size_fb_long) and pos_size_fb_long > 0 and not na(tp_price_fb_long) and tp_price_fb_long > entry_price_fb_long
-                        strategy.entry("LRA FB Long", strategy.long, qty=pos_size_fb_long)
-                        strategy.exit("FB Long Exit", from_entry="LRA FB Long", stop=sl_price_fb_long, limit=tp_price_fb_long)
-                        sl_price_var := sl_price_fb_long
-                        tp_price_var := tp_price_fb_long
-                        plot_lr_color := color.new(color.aqua, 70)
-                        plot_lr_text  := "FB Support LR"
-                        new_lr_for_plot := true
-                        if enable_long_alerts
-                            alert("LRA FB Long: False break below " + str.tostring(active_lr_low) + ", C: " + str.tostring(close), alert.freq_once_per_bar_close)
-                        in_potential_lr       := false
-                        is_monitoring_fb_down := false
+            if (bar_index <= fb_down_trigger_bar + fb_return_bars) and (close > active_lr_low) and vol_cond_fb_breakout
+                float entry_price_fb_long = close
+                float sl_price_fb_long = fb_down_trigger_low - sl_buffer_atr * atr_val
+                float tp_price_fb_long = active_lr_high
+                float pos_size_fb_long = f_calc_position_size(entry_price_fb_long, sl_price_fb_long)
+                if not na(pos_size_fb_long) and pos_size_fb_long > 0 and not na(tp_price_fb_long) and tp_price_fb_long > entry_price_fb_long
+                    string alert_payload = f_build_signal_payload("False Breakout", "LONG", entry_price_fb_long, tp_price_fb_long, sl_price_fb_long)
+                    strategy.entry("LRA FB Long", strategy.long, qty=pos_size_fb_long, alert_message=alert_payload)
+                    strategy.exit("FB Long Exit", from_entry="LRA FB Long", stop=sl_price_fb_long, limit=tp_price_fb_long)
+                    sl_price_var := sl_price_fb_long
+                    tp_price_var := tp_price_fb_long
+                    plot_lr_color := color.new(color.aqua, 70)
+                    plot_lr_text  := "FB Support LR"
+                    new_lr_for_plot := true
+                    in_potential_lr := false
+                    is_monitoring_fb_down := false
             else if (bar_index > fb_down_trigger_bar + fb_return_bars) or is_std_short_breakout
                 is_monitoring_fb_down := false
 
@@ -256,15 +229,14 @@ if in_potential_lr and strategy.position_size == 0
             if tp_price_std_long > entry_price_std_long
                 float pos_size_std_long = f_calc_position_size(entry_price_std_long, sl_price_std_long)
                 if not na(pos_size_std_long) and pos_size_std_long > 0
-                    strategy.entry("LRA Std Long", strategy.long, qty=pos_size_std_long)
+                    string alert_payload = f_build_signal_payload("Standard Breakout", "LONG", entry_price_std_long, tp_price_std_long, sl_price_std_long)
+                    strategy.entry("LRA Std Long", strategy.long, qty=pos_size_std_long, alert_message=alert_payload)
                     strategy.exit("Std Long Exit", from_entry="LRA Std Long", stop=sl_price_std_long, limit=tp_price_std_long)
                     sl_price_var := sl_price_std_long
                     tp_price_var := tp_price_std_long
                     plot_lr_color := color.new(color.green, 70)
                     plot_lr_text  := "Support LR"
                     new_lr_for_plot := true
-                    if enable_long_alerts
-                        alert("LRA Std Long: C=" + str.tostring(close) + " above LR " + str.tostring(active_lr_high) + ". TP=" + str.tostring(tp_price_std_long), alert.freq_once_per_bar_close)
                     in_potential_lr := false
         else if is_std_short_breakout and not na(dynamic_tpsl1_for_short_trade)
             float entry_price_std_short = close
@@ -273,55 +245,43 @@ if in_potential_lr and strategy.position_size == 0
             if tp_price_std_short < entry_price_std_short
                 float pos_size_std_short = f_calc_position_size(entry_price_std_short, sl_price_std_short)
                 if not na(pos_size_std_short) and pos_size_std_short > 0
-                    strategy.entry("LRA Std Short", strategy.short, qty=pos_size_std_short)
+                    string alert_payload = f_build_signal_payload("Standard Breakout", "SHORT", entry_price_std_short, tp_price_std_short, sl_price_std_short)
+                    strategy.entry("LRA Std Short", strategy.short, qty=pos_size_std_short, alert_message=alert_payload)
                     strategy.exit("Std Short Exit", from_entry="LRA Std Short", stop=sl_price_std_short, limit=tp_price_std_short)
                     sl_price_var := sl_price_std_short
                     tp_price_var := tp_price_std_short
                     plot_lr_color := color.new(color.red, 70)
                     plot_lr_text  := "Resistance LR"
                     new_lr_for_plot := true
-                    if enable_short_alerts
-                        alert("LRA Std Short: C=" + str.tostring(close) + " below LR " + str.tostring(active_lr_low) + ". TP=" + str.tostring(tp_price_std_short), alert.freq_once_per_bar_close)
                     in_potential_lr := false
-
     else if not na(active_lr_start_bar) and (bar_index > active_lr_start_bar + lr_detect_lookback * 2)
-        in_potential_lr   := false
-        new_lr_for_plot   := false
-        plot_lr_h         := na
-        plot_lr_l         := na
+        in_potential_lr := false
+        new_lr_for_plot := false
+        plot_lr_h := na
+        plot_lr_l := na
 
-// Clear SL/TP plot variables when flat
 if strategy.position_size == 0
     sl_price_var := na
     tp_price_var := na
-    if not in_potential_lr
-        dynamic_tpsl1_for_long_trade  := na
-        dynamic_tpsl1_for_short_trade := na
+if not in_potential_lr
+    dynamic_tpsl1_for_long_trade := na
+    dynamic_tpsl1_for_short_trade := na
 
-// --- Step 4: Plotting ---
-// FIX: Refactored plotting to manage a single box object, preventing the 500-bar drawing error.
+// PLOTTING
 var box lr_display_box = box.new(na, na, na, na, xloc=xloc.bar_time, border_color=na, bgcolor=na, text=na)
-
 if new_lr_for_plot
     box.set_lefttop(lr_display_box, plot_lr_start_time, plot_lr_h)
     box.set_rightbottom(lr_display_box, time, plot_lr_l)
     box.set_border_color(lr_display_box, plot_lr_color)
     box.set_bgcolor(lr_display_box, color.new(plot_lr_color, 85))
     box.set_text(lr_display_box, plot_lr_text)
-    box.set_text_color(lr_display_box, color.white)
-    box.set_text_size(lr_display_box, size.small)
-    box.set_text_halign(lr_display_box, text.align_center)
-    box.set_text_valign(lr_display_box, text.align_center)
     new_lr_for_plot := false
 else if in_potential_lr and not na(lr_display_box)
     box.set_right(lr_display_box, time)
 else if strategy.position_size == 0 and not in_potential_lr
-    box.set_left(lr_display_box, na) // Hide the box when not in use
+    box.set_left(lr_display_box, na)
 
-// Plot SL and TP for active trades
 plot(strategy.position_size != 0 ? sl_price_var : na, title="Active SL", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
 plot(strategy.position_size != 0 ? tp_price_var : na, title="Active TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
-
-// Plot potential dynamic TPSL1 levels when a potential LR is identified
 plot(in_potential_lr and not na(dynamic_tpsl1_for_long_trade) and strategy.position_size == 0 ? dynamic_tpsl1_for_long_trade : na, title="Potential TPSL1 High", color=color.new(color.blue, 30), style=plot.style_circles, linewidth=1)
 plot(in_potential_lr and not na(dynamic_tpsl1_for_short_trade) and strategy.position_size == 0 ? dynamic_tpsl1_for_short_trade : na, title="Potential TPSL1 Low",  color=color.new(color.purple, 30), style=plot.style_circles, linewidth=1)
