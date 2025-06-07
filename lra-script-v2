@@ -1,5 +1,5 @@
 //@version=6
-strategy("LRA MM Strategy v2.5 (Direct Webhook)",
+strategy("LRA MM Strategy v2.5 (Comprehensive Webhooks)",
      overlay=true,
      initial_capital=10000,
      commission_value=0.01,
@@ -47,7 +47,6 @@ asset_image_url      = input.string("https://s3.tradingview.com/userpics/622435-
 asset_type_for_topic = input.string("CRYPTO", "Asset Type (for Topic/Channel)", group=GRP_ALERTS, tooltip="e.g., CRYPTO, FX, STOCKS. Used by your server to route the message.")
 
 // === FUNCTIONS ===
-// FIX: Meticulously corrected indentation and structure for all functions.
 f_calc_position_size(float entry_price, float sl_price) =>
     risk_per_share = math.abs(entry_price - sl_price)
     risk_amount = strategy.equity * (risk_percent / 100)
@@ -97,7 +96,11 @@ f_calc_dynamic_tpsl1(bool is_for_long, float lr_h, float lr_l, float lr_height_v
     final_tpsl
 
 f_build_signal_payload(string trade_type, string direction, float entry, float tp, float sl) =>
-    '{' + '"asset_name": "'   + asset_name + '",' +'"asset_type": "'   + asset_type_for_topic + '",' +'"symbol": "' + syminfo.ticker + '",' +'"image_url": "' + asset_image_url + '",' +'"trade_type": "' + trade_type + '",' +'"direction": "' + direction + '",' +'"entry_price": '   + str.tostring(entry, '#.#####') + ',' + '"take_profit": '   + str.tostring(tp, '#.#####') + ',' +'"stop_loss": ' + str.tostring(sl, '#.#####') + ',' +'"timeframe": "'  + timeframe.period + '"' +'}'
+    '{' + '"asset_name":"' + asset_name + '",' + '"asset_type":"' + asset_type_for_topic + '",' + '"symbol":"' + syminfo.ticker + '",' + '"image_url":"' + asset_image_url + '",' + '"trade_type":"' + trade_type + '",' + '"direction":"' + direction + '",' + '"entry_price":' + str.tostring(entry, '#.#####') + ',' + '"take_profit":' + str.tostring(tp, '#.#####') + ',' + '"stop_loss":' + str.tostring(sl, '#.#####') + ',' + '"timeframe":"' + timeframe.period + '"' + '}'
+
+f_build_close_payload(string trade_id, string reason) =>
+    '{' + '"asset_name":"' + asset_name + '",' + '"asset_type":"' + asset_type_for_topic + '",' + '"symbol":"' + syminfo.ticker + '",' + '"image_url":"' + asset_image_url + '",' + '"trade_type":"Position Close",' + '"direction":"NEUTRAL",' + '"reason":"' + reason + '",' + '"closed_trade_id":"' + trade_id + '",' + '"close_price":' + str.tostring(close, '#.#####') + ',' + '"timeframe":"' + timeframe.period + '"' + '}'
+
 
 // === VARIABLES & INDICATORS ===
 var float active_lr_high    = na
@@ -121,6 +124,11 @@ var int   plot_lr_start_time  = na
 var color plot_lr_color       = na
 var string plot_lr_text       = ""
 var bool  new_lr_for_plot     = false
+
+var string active_trade_id = ""
+var float active_tp_level = na
+var float active_sl_level = na
+
 atr_val    = ta.atr(14)
 avg_volume = ta.sma(volume, volume_ma_period)
 swing_high_candidate = ta.highest(high, tpsl1_swing_lookback)[1]
@@ -131,6 +139,29 @@ float potential_lr_l_candidate = ta.lowest(low,  lr_detect_lookback)[1]
 // === MAIN LOGIC ===
 dynamic_tpsl1_for_long_trade  := f_calc_dynamic_tpsl1(true,  active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
 dynamic_tpsl1_for_short_trade := f_calc_dynamic_tpsl1(false, active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
+
+// --- Active TP/SL Monitoring ---
+if strategy.position_size != 0
+    if strategy.position_size > 0 // Long position is open
+        if high >= active_tp_level
+            string close_payload = f_build_close_payload(active_trade_id, "Take Profit Hit")
+            strategy.close(active_trade_id, comment="TP Hit", alert_message=close_payload)
+        else if low <= active_sl_level
+            string close_payload = f_build_close_payload(active_trade_id, "Stop Loss Hit")
+            strategy.close(active_trade_id, comment="SL Hit", alert_message=close_payload)
+    else // Short position is open
+        if low <= active_tp_level
+            string close_payload = f_build_close_payload(active_trade_id, "Take Profit Hit")
+            strategy.close(active_trade_id, comment="TP Hit", alert_message=close_payload)
+        else if high >= active_sl_level
+            string close_payload = f_build_close_payload(active_trade_id, "Stop Loss Hit")
+            strategy.close(active_trade_id, comment="SL Hit", alert_message=close_payload)
+
+// Reset trade state when flat
+if strategy.position_size == 0
+    active_trade_id := ""
+    active_tp_level := na
+    active_sl_level := na
 
 if strategy.position_size != 0 or not in_potential_lr
     is_monitoring_fb_up := false
@@ -159,7 +190,7 @@ if not in_potential_lr and strategy.position_size == 0
             plot_lr_text := "Potential LR"
             new_lr_for_plot := true
 
-if in_potential_lr and strategy.position_size == 0
+if in_potential_lr and strategy.opentrades == 0
     float breakout_margin = lr_breakout_confirmation_atr * atr_val
     float long_breakout_level = active_lr_high + breakout_margin
     float short_breakout_level = active_lr_low - breakout_margin
@@ -184,9 +215,14 @@ if in_potential_lr and strategy.position_size == 0
                 float tp_price_fb_short = active_lr_low
                 float pos_size_fb_short = f_calc_position_size(entry_price_fb_short, sl_price_fb_short)
                 if not na(pos_size_fb_short) and pos_size_fb_short > 0 and not na(tp_price_fb_short) and tp_price_fb_short < entry_price_fb_short
+                    if strategy.position_size > 0
+                        string close_payload = f_build_close_payload(active_trade_id, "Opposing SHORT Signal")
+                        strategy.close(active_trade_id, comment="Reversal Close", alert_message=close_payload)
                     string alert_payload = f_build_signal_payload("False Breakout", "SHORT", entry_price_fb_short, tp_price_fb_short, sl_price_fb_short)
                     strategy.entry("LRA FB Short", strategy.short, qty=pos_size_fb_short, alert_message=alert_payload)
-                    strategy.exit("FB Short Exit", from_entry="LRA FB Short", stop=sl_price_fb_short, limit=tp_price_fb_short)
+                    active_trade_id := "LRA FB Short"
+                    active_tp_level := tp_price_fb_short
+                    active_sl_level := sl_price_fb_short
                     sl_price_var := sl_price_fb_short
                     tp_price_var := tp_price_fb_short
                     plot_lr_color := color.new(color.orange, 70)
@@ -208,9 +244,14 @@ if in_potential_lr and strategy.position_size == 0
                 float tp_price_fb_long = active_lr_high
                 float pos_size_fb_long = f_calc_position_size(entry_price_fb_long, sl_price_fb_long)
                 if not na(pos_size_fb_long) and pos_size_fb_long > 0 and not na(tp_price_fb_long) and tp_price_fb_long > entry_price_fb_long
+                    if strategy.position_size < 0
+                        string close_payload = f_build_close_payload(active_trade_id, "Opposing LONG Signal")
+                        strategy.close(active_trade_id, comment="Reversal Close", alert_message=close_payload)
                     string alert_payload = f_build_signal_payload("False Breakout", "LONG", entry_price_fb_long, tp_price_fb_long, sl_price_fb_long)
                     strategy.entry("LRA FB Long", strategy.long, qty=pos_size_fb_long, alert_message=alert_payload)
-                    strategy.exit("FB Long Exit", from_entry="LRA FB Long", stop=sl_price_fb_long, limit=tp_price_fb_long)
+                    active_trade_id := "LRA FB Long"
+                    active_tp_level := tp_price_fb_long
+                    active_sl_level := sl_price_fb_long
                     sl_price_var := sl_price_fb_long
                     tp_price_var := tp_price_fb_long
                     plot_lr_color := color.new(color.aqua, 70)
@@ -221,7 +262,7 @@ if in_potential_lr and strategy.position_size == 0
             else if (bar_index > fb_down_trigger_bar + fb_return_bars) or is_std_short_breakout
                 is_monitoring_fb_down := false
 
-    if strategy.position_size == 0 and in_potential_lr and vol_cond_std_breakout and session_condition_met
+    if strategy.opentrades == 0 and in_potential_lr and vol_cond_std_breakout and session_condition_met
         if is_std_long_breakout and not na(dynamic_tpsl1_for_long_trade)
             float entry_price_std_long = close
             float sl_price_std_long = active_lr_low - sl_buffer_atr * atr_val
@@ -229,9 +270,14 @@ if in_potential_lr and strategy.position_size == 0
             if tp_price_std_long > entry_price_std_long
                 float pos_size_std_long = f_calc_position_size(entry_price_std_long, sl_price_std_long)
                 if not na(pos_size_std_long) and pos_size_std_long > 0
+                    if strategy.position_size < 0
+                        string close_payload = f_build_close_payload(active_trade_id, "Opposing LONG Signal")
+                        strategy.close(active_trade_id, comment="Reversal Close", alert_message=close_payload)
                     string alert_payload = f_build_signal_payload("Standard Breakout", "LONG", entry_price_std_long, tp_price_std_long, sl_price_std_long)
                     strategy.entry("LRA Std Long", strategy.long, qty=pos_size_std_long, alert_message=alert_payload)
-                    strategy.exit("Std Long Exit", from_entry="LRA Std Long", stop=sl_price_std_long, limit=tp_price_std_long)
+                    active_trade_id := "LRA Std Long"
+                    active_tp_level := tp_price_std_long
+                    active_sl_level := sl_price_std_long
                     sl_price_var := sl_price_std_long
                     tp_price_var := tp_price_std_long
                     plot_lr_color := color.new(color.green, 70)
@@ -245,9 +291,14 @@ if in_potential_lr and strategy.position_size == 0
             if tp_price_std_short < entry_price_std_short
                 float pos_size_std_short = f_calc_position_size(entry_price_std_short, sl_price_std_short)
                 if not na(pos_size_std_short) and pos_size_std_short > 0
+                    if strategy.position_size > 0
+                        string close_payload = f_build_close_payload(active_trade_id, "Opposing SHORT Signal")
+                        strategy.close(active_trade_id, comment="Reversal Close", alert_message=close_payload)
                     string alert_payload = f_build_signal_payload("Standard Breakout", "SHORT", entry_price_std_short, tp_price_std_short, sl_price_std_short)
                     strategy.entry("LRA Std Short", strategy.short, qty=pos_size_std_short, alert_message=alert_payload)
-                    strategy.exit("Std Short Exit", from_entry="LRA Std Short", stop=sl_price_std_short, limit=tp_price_std_short)
+                    active_trade_id := "LRA Std Short"
+                    active_tp_level := tp_price_std_short
+                    active_sl_level := sl_price_std_short
                     sl_price_var := sl_price_std_short
                     tp_price_var := tp_price_std_short
                     plot_lr_color := color.new(color.red, 70)
