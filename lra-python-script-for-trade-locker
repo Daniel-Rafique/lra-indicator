@@ -1,0 +1,163 @@
+import backtrader as bt
+import math
+
+class LraMmStrategy(bt.Strategy):
+    params = (
+        # LR Identification inputs
+        ('lr_detect_lookback', 20),
+        ('lr_min_bars_consolidation', 5),
+        ('lr_min_height_atr', 0.5),
+        ('lr_max_height_atr', 3.0),
+        ('lr_breakout_confirmation_atr', 0.1),
+        # TP Projection input (used as multiplier for LR height)
+        ('tpsl_lr_height_multiplier', 1.0),
+        ('tpsl_swing_lookback', 30),  # Not used in this simplification
+        # Volume & Imbalance
+        ('use_volume_confirmation', True),
+        ('volume_ma_period', 20),
+        ('volume_threshold_factor_std', 1.5),
+        ('volume_threshold_factor_fb', 1.0),  # Not used here
+        # Dynamic Exit Strategy
+        ('use_trailing_stop', True),
+        ('tsl_atr_period', 14),
+        ('tsl_atr_multiplier', 2.5),
+        ('use_rsi_exit', False),  # Set True to enable RSI exit override
+        ('rsi_period', 14),
+        ('rsi_exit_cross_level_long', 65),
+        ('rsi_exit_cross_level_short', 35),
+        ('rsi_overbought', 70),   # For potential future use
+        ('rsi_oversold', 30),     # For potential future use
+        # Risk & Position Sizing
+        ('risk_percent', 1.0),    # % of equity to risk per trade
+        ('sl_buffer_atr', 0.2),
+    )
+
+    def __init__(self):
+        # Indicators
+        self.atr = bt.indicators.AverageTrueRange(self.data, period=14)
+        self.tsl_atr = bt.indicators.AverageTrueRange(self.data, period=self.p.tsl_atr_period)
+        self.rsi = bt.indicators.RSI_SMA(self.data.close, period=self.p.rsi_period)
+        self.vol_ma = bt.indicators.MovingAverageSimple(self.data.volume, period=self.p.volume_ma_period)
+        
+        # State variables to simulate Locked Range data and dynamic exits
+        self.in_potential_lr = False
+        self.active_lr_high = None
+        self.active_lr_low = None
+        self.active_lr_height = None
+        self.active_tp_level = None
+        self.active_sl_level = None
+        self.entry_price = None
+        self.trail_sl_price = None
+        self.order = None
+
+    def calc_position_size(self, entry, stop):
+        risk_per_share = abs(entry - stop)
+        if risk_per_share == 0:
+            return 0
+        risk_amount = self.broker.getvalue() * (self.p.risk_percent / 100.0)
+        size = risk_amount / risk_per_share
+        return size
+
+    def next(self):
+        atr_val = self.atr[0]
+        # --- LR Detection: only when flat and no active LR ---
+        if not self.position and not self.in_potential_lr:
+            if len(self.data) >= self.p.lr_detect_lookback:
+                potential_lr_high = max(self.data.high.get(size=self.p.lr_detect_lookback))
+                potential_lr_low = min(self.data.low.get(size=self.p.lr_detect_lookback))
+                potential_lr_height = potential_lr_high - potential_lr_low
+                if (potential_lr_height >= self.p.lr_min_height_atr * atr_val and
+                    potential_lr_height <= self.p.lr_max_height_atr * atr_val):
+                    # Check consolidation using previous bars only (skip index 0)
+                    bars_in_range = 0
+                    lookback = min(len(self.data), self.p.lr_min_bars_consolidation + 1)
+                    for i in range(1, lookback):
+                        if self.data.high[-i] <= potential_lr_high and self.data.low[-i] >= potential_lr_low:
+                            bars_in_range += 1
+                    if bars_in_range >= self.p.lr_min_bars_consolidation:
+                        self.in_potential_lr = True
+                        self.active_lr_high = potential_lr_high
+                        self.active_lr_low = potential_lr_low
+                        self.active_lr_height = potential_lr_height
+
+        # --- Breakout Entry Logic ---
+        if self.in_potential_lr and not self.position:
+            breakout_margin = self.p.lr_breakout_confirmation_atr * atr_val
+            long_breakout_level = self.active_lr_high + breakout_margin
+            short_breakout_level = self.active_lr_low - breakout_margin
+            vol_condition = (self.data.volume[0] < self.vol_ma[0] * self.p.volume_threshold_factor_std) \
+                              if self.p.use_volume_confirmation else True
+
+            # Long breakout detected
+            if self.data.close[0] > long_breakout_level and vol_condition:
+                tp = self.active_lr_high + (self.active_lr_height * self.p.tpsl_lr_height_multiplier)
+                sl = self.active_lr_low - self.p.sl_buffer_atr * atr_val
+                size = self.calc_position_size(self.data.close[0], sl)
+                if size > 0:
+                    self.order = self.buy(size=size)
+                    self.active_tp_level = tp
+                    self.active_sl_level = sl
+                    self.entry_price = self.data.close[0]
+                    self.trail_sl_price = None
+                    self.in_potential_lr = False  # reset after entry
+            # Short breakout detected
+            elif self.data.close[0] < short_breakout_level and vol_condition:
+                tp = self.active_lr_low - (self.active_lr_height * self.p.tpsl_lr_height_multiplier)
+                sl = self.active_lr_high + self.p.sl_buffer_atr * atr_val
+                size = self.calc_position_size(self.data.close[0], sl)
+                if size > 0:
+                    self.order = self.sell(size=size)
+                    self.active_tp_level = tp
+                    self.active_sl_level = sl
+                    self.entry_price = self.data.close[0]
+                    self.trail_sl_price = None
+                    self.in_potential_lr = False  # reset after entry
+
+        # --- Position Management (Dynamic Exits) ---
+        if self.position:
+            # Long position management
+            if self.position.size > 0:
+                if self.data.low[0] <= self.active_sl_level:
+                    self.close()
+                elif self.data.high[0] >= self.active_tp_level:
+                    self.close()
+                else:
+                    if self.p.use_trailing_stop:
+                        if self.data.high[0] > self.entry_price + atr_val or self.trail_sl_price is not None:
+                            new_trail = self.data.high[0] - (self.tsl_atr[0] * self.p.tsl_atr_multiplier)
+                            self.trail_sl_price = new_trail if self.trail_sl_price is None else max(self.trail_sl_price, new_trail)
+                            if self.data.low[0] <= self.trail_sl_price:
+                                self.close()
+                    if self.p.use_rsi_exit and self.rsi[0] < self.p.rsi_exit_cross_level_long:
+                        self.close()
+
+            # Short position management
+            elif self.position.size < 0:
+                if self.data.high[0] >= self.active_sl_level:
+                    self.close()
+                elif self.data.low[0] <= self.active_tp_level:
+                    self.close()
+                else:
+                    if self.p.use_trailing_stop:
+                        if self.data.low[0] < self.entry_price - atr_val or self.trail_sl_price is not None:
+                            new_trail = self.data.low[0] + (self.tsl_atr[0] * self.p.tsl_atr_multiplier)
+                            self.trail_sl_price = new_trail if self.trail_sl_price is None else min(self.trail_sl_price, new_trail)
+                            if self.data.high[0] >= self.trail_sl_price:
+                                self.close()
+                    if self.p.use_rsi_exit and self.rsi[0] > self.p.rsi_exit_cross_level_short:
+                        self.close()
+
+        # --- Optional Reset of LR if conditions are no longer valid ---
+        # Rather than always resetting when flat, we can decide to reset
+        # only if price moves too far away from the locked range.
+        if not self.position and self.in_potential_lr:
+            # For example: if the current close is far from both active LR bounds, then reset.
+            if self.data.close[0] > self.active_lr_high * 1.02 or self.data.close[0] < self.active_lr_low * 0.98:
+                self.active_lr_high = None
+                self.active_lr_low = None
+                self.active_lr_height = None
+                self.in_potential_lr = False
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            self.order = None
