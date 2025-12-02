@@ -1,0 +1,653 @@
+//@version=6
+// BASE: LRA MM Strategy v4.0 (Dynamic Exits + Original Alerts)
+// ADDED: SMC / IFC module (Option C: session filter only, no volume / LR dependency)
+//  - Toggle for IFC candles
+//  - IFC entries with TP1 / TP2 (50% at TP1, SL to BE, full at TP2)
+
+strategy("LRA MM Strategy v4.0 + SMC IFC (Option C)",
+     overlay=true,
+     initial_capital=10000,
+     commission_value=0.01,
+     commission_type=strategy.commission.percent,
+     calc_on_every_tick=false,
+     pyramiding=0)
+
+// === Constants ===
+var string GRP_LR      = "1. Locked-in Range (LR) Identification"
+var string GRP_TPSL    = "2. Initial TP & False Breakout"
+var string GRP_VOL     = "3. Volume & Imbalance Confirmation"
+var string GRP_EXIT    = "4. Dynamic Exit Strategy"
+var string GRP_RISK    = "5. Risk & Position Sizing"
+var string GRP_SESSION = "6. Session Filter"
+var string GRP_SLR     = "7. Stop-Loss Reversal (SLR) System"
+var string GRP_ALERTS  = "8. Alerts"
+var string GRP_SMC     = "9. SMC / IFC Candles"          // NEW GROUP
+// === Dashboard variables ===
+var string ifc_signal_type = ""
+var bool enable_ifc_entries = true  // IFC entries always on unless user wants toggle later
+
+
+// === INPUTS ===
+// LR Identification
+lr_detect_lookback          = input.int(20, "LR Detection Lookback", minval=5, group=GRP_LR)
+lr_min_bars_consolidation   = input.int(5,  "LR Min Bars in Consolidation", minval=2, group=GRP_LR)
+lr_min_height_atr           = input.float(0.5, "LR Min Height (ATR multiples)", minval=0.1, step=0.1, group=GRP_LR)
+lr_max_height_atr           = input.float(3.0, "LR Max Height (ATR multiples)", minval=0.1, step=0.1, group=GRP_LR)
+lr_breakout_confirmation_atr = input.float(0.1, "LR Breakout Confirmation (ATR multiples)", minval=0.0, step=0.05, group=GRP_LR)
+
+// Initial TP & False Breakout
+tpsl1_swing_lookback        = input.int(30, "Initial TP Swing H/L Lookback", minval=5, group=GRP_TPSL)
+tpsl1_use_lr_height_projection = input.bool(true, "Initial TP Use LR Height Projection?", group=GRP_TPSL)
+tpsl1_lr_height_multiplier  = input.float(1.0, "Initial TP LR Height Multiplier", minval=0.1, step=0.1, group=GRP_TPSL)
+enable_false_breakout_entries = input.bool(true, "Enable False Breakout Entries?", group=GRP_TPSL)
+fb_max_penetration_pct_lr   = input.float(20.0, "FB Max Penetration (% of LR Height)", minval=1.0, maxval=50.0, step=1.0, group=GRP_TPSL)
+fb_return_bars              = input.int(1, "FB Price Return Bars", minval=1, maxval=3, group=GRP_TPSL)
+
+// Volume & Imbalance
+use_volume_confirmation     = input.bool(true, "Use Volume Confirmation (Standard & FB)?", group=GRP_VOL)
+volume_ma_period            = input.int(20, "Volume MA Period", minval=1, group=GRP_VOL)
+volume_threshold_factor_std = input.float(1.5, "Max Breakout Vol Factor (Standard)", group=GRP_VOL)
+volume_threshold_factor_fb  = input.float(1.0, "Max Breakout Vol Factor (False Breakout)", group=GRP_VOL)
+
+// Dynamic Exit Strategy Inputs
+use_trailing_stop           = input.bool(true, "Enable ATR Trailing Stop?", group=GRP_EXIT)
+tsl_atr_period              = input.int(14, "Trailing SL ATR Period", group=GRP_EXIT)
+tsl_atr_multiplier          = input.float(2.5, "Trailing SL ATR Multiplier", group=GRP_EXIT)
+use_rsi_exit                = input.bool(false, "Enable RSI Exit?", group=GRP_EXIT)
+rsi_period                  = input.int(14, "RSI Period", group=GRP_EXIT)
+rsi_overbought              = input.int(70, "RSI Overbought Level", group=GRP_EXIT)
+rsi_oversold                = input.int(30, "RSI Oversold Level", group=GRP_EXIT)
+rsi_exit_cross_level_long   = input.int(65, "RSI Exit Level (Longs)", group=GRP_EXIT)
+rsi_exit_cross_level_short  = input.int(35, "RSI Exit Level (Shorts)", group=GRP_EXIT)
+
+// Risk & Position Sizing
+risk_percent                = input.float(1.0, "Risk per Trade (% of Equity)", minval=0.1, maxval=10.0, step=0.1, group=GRP_RISK)
+sl_buffer_atr               = input.float(0.2, "SL Buffer (ATR multiples from LR boundary/FB extreme)", minval=0.0, step=0.1, group=GRP_RISK)
+
+// Session Filter
+use_session_filter          = input.bool(false, "Use Session Filter?", group=GRP_SESSION)
+trade_session               = input.session("0930-1600", "Trading Session (Exchange Timezone)", group=GRP_SESSION)
+
+// SLR System
+enable_sl_reversals         = input.bool(true, "Enable Stop-Loss Reversal Entries?", group=GRP_SLR)
+slr_tp_multiplier_atr       = input.float(3.0, "SLR TP Multiplier (ATR)", minval=0.1, step=0.1, group=GRP_SLR)
+slr_sl_multiplier_atr       = input.float(1.5, "SLR SL Multiplier (ATR)", minval=0.1, step=0.1, group=GRP_SLR)
+
+// Alerts
+webhook_url          = input.string("", "Your Server Webhook URL", group=GRP_ALERTS)
+
+// === NEW SMC / IFC INPUTS (Option C) ===
+enable_smc_logic     = input.bool(true,  "Enable SMC/IFC Candles & Entries?", group=GRP_SMC)
+smc_lookback         = input.int(10,     "Liquidity Sweep Lookback", minval=3, group=GRP_SMC)
+smc_show_candles     = input.bool(true,  "Color IFC Candles?", group=GRP_SMC)
+smc_risk_reward_1    = input.float(1.5,  "IFC TP1 (R:R)", group=GRP_SMC)
+smc_risk_reward_2    = input.float(3.0,  "IFC TP2 (R:R)", group=GRP_SMC)
+
+// === FUNCTIONS ===
+f_calc_position_size(float entry_price, float sl_price) =>
+    risk_per_share = math.abs(entry_price - sl_price)
+    risk_amount    = strategy.equity * (risk_percent / 100)
+    qty            = risk_per_share > 0 ? (risk_amount / risk_per_share) : 0.0
+    qty > 0 ? qty : na
+
+f_calc_dynamic_tpsl1(bool is_for_long, float lr_h, float lr_l, float lr_height_val, float swing_high, float swing_low) =>
+    float tpsl_swing        = na
+    float tpsl_lr_projection = na
+    float final_tpsl        = na
+    if is_for_long
+        bool is_sig_swing = false
+        if not na(swing_high) and swing_high > lr_h
+            is_sig_swing := true
+        for i = 1 to tpsl1_swing_lookback - 1
+            if high[i] > swing_high
+                is_sig_swing := false
+                break
+        if is_sig_swing
+            tpsl_swing := swing_high
+        if tpsl1_use_lr_height_projection and not na(lr_height_val)
+            tpsl_lr_projection := lr_h + (lr_height_val * tpsl1_lr_height_multiplier)
+        if not na(tpsl_swing) and not na(tpsl_lr_projection)
+            final_tpsl := math.min(tpsl_swing, tpsl_lr_projection)
+        else if not na(tpsl_swing)
+            final_tpsl := tpsl_swing
+        else if not na(tpsl_lr_projection)
+            final_tpsl := tpsl_lr_projection
+    else
+        bool is_sig_swing2 = false
+        if not na(swing_low) and swing_low < lr_l
+            is_sig_swing2 := true
+        for i = 1 to tpsl1_swing_lookback - 1
+            if low[i] < swing_low
+                is_sig_swing2 := false
+                break
+        if is_sig_swing2
+            tpsl_swing := swing_low
+        if tpsl1_use_lr_height_projection and not na(lr_height_val)
+            tpsl_lr_projection := lr_l - (lr_height_val * tpsl1_lr_height_multiplier)
+        if not na(tpsl_swing) and not na(tpsl_lr_projection)
+            final_tpsl := math.max(tpsl_swing, tpsl_lr_projection)
+        else if not na(tpsl_swing)
+            final_tpsl := tpsl_swing
+        else if not na(tpsl_lr_projection)
+            final_tpsl := tpsl_lr_projection
+    final_tpsl
+
+f_build_signal_payload(string trade_type, string direction, float entry, float tp, float sl) =>
+    '{' + '"symbol":"' + syminfo.ticker  + '",' + '"trade_type":"'  + trade_type + '",' + '"direction":"'   + direction  + '",' +  '"entry_price":'  + str.tostring(entry, '#.#####') + ',' +'"take_profit":'  + str.tostring(tp,    '#.#####') + ',' + '"stop_loss":'    + str.tostring(sl,    '#.#####') + ',' +'"timeframe":"'   + timeframe.period  + '"'  +'}'
+
+f_build_close_payload(string trade_id, string reason) =>
+    '{' +'"symbol":"'  + syminfo.ticker  + '",' +'"trade_type":"Position Close",' + '"direction":"NEUTRAL",' +'"reason":"' + reason  + '",' +'"closed_trade_id":"' + trade_id + '",' +'"close_price":'     + str.tostring(close, '#.#####') + ',' +'"timeframe":"'      + timeframe.period  + '"'  +'}'
+
+// === VARIABLES & INDICATORS ===
+var float active_lr_high    = na
+var float active_lr_low     = na
+var int   active_lr_start_bar = na
+var float active_lr_height  = na
+var bool  in_potential_lr   = false
+var float dynamic_tpsl1_for_long_trade  = na
+var float dynamic_tpsl1_for_short_trade = na
+var bool  is_monitoring_fb_up   = false
+var float fb_up_trigger_high    = na
+var int   fb_up_trigger_bar     = na
+var bool  is_monitoring_fb_down = false
+var float fb_down_trigger_low   = na
+var int   fb_down_trigger_bar   = na
+var float sl_price_var          = na
+var float tp_price_var          = na
+var float plot_lr_h             = na
+var float plot_lr_l             = na
+var int   plot_lr_start_time    = na
+var color plot_lr_color         = na
+var string plot_lr_text         = ""
+var bool  new_lr_for_plot       = false
+var string active_trade_id      = ""
+var float active_tp_level       = na
+var float active_sl_level       = na
+
+// Dynamic exit state
+var float trail_sl_price        = na
+var bool  was_rsi_over          = false
+
+// Entry label state
+var string entry_signal_text    = ""
+var float entry_signal_price    = na
+var label entry_label           = na
+
+// NEW: SMC state
+var float smc_tp1               = na
+var float smc_tp2               = na
+var bool  is_smc_trade          = false
+var bool  smc_tp1_hit           = false
+
+atr_val    = ta.atr(14)
+avg_volume = ta.sma(volume, volume_ma_period)
+swing_high_candidate = ta.highest(high, tpsl1_swing_lookback)[1]
+swing_low_candidate  = ta.lowest(low,  tpsl1_swing_lookback)[1]
+float potential_lr_h_candidate = ta.highest(high, lr_detect_lookback)[1]
+float potential_lr_l_candidate = ta.lowest(low,  lr_detect_lookback)[1]
+
+tsl_atr_val = ta.atr(tsl_atr_period)
+rsi_val     = ta.rsi(close, rsi_period)
+rsi_crossed_down_exit_level = ta.crossunder(rsi_val, rsi_exit_cross_level_long)
+rsi_crossed_up_exit_level   = ta.crossover(rsi_val, rsi_exit_cross_level_short)
+
+// === SESSION CONDITION (shared by LRA & SMC) ===
+time_in_session      = time(timeframe.period, trade_session)
+bool session_condition_met = not use_session_filter or not na(time_in_session)
+
+// === SMC / IFC DETECTION (Option C: no LR / volume dependency) ===
+float liquidity_high = ta.highest(high, smc_lookback)[1]
+float liquidity_low  = ta.lowest(low,  smc_lookback)[1]
+
+// Bullish IFC: sweep low + strong bullish displacement
+bool sweep_low            = low < liquidity_low
+bool bullish_displacement = close > open and (close - open) > (high - low) * 0.6
+bool is_bullish_ifc       = sweep_low and bullish_displacement and close > liquidity_low
+
+// Bearish IFC: sweep high + strong bearish displacement
+bool sweep_high           = high > liquidity_high
+bool bearish_displacement = close < open and (open - close) > (high - low) * 0.6
+bool is_bearish_ifc       = sweep_high and bearish_displacement and close < liquidity_high
+
+// Candle coloring
+smc_bar_color =
+     enable_smc_logic and smc_show_candles and is_bullish_ifc ? color.new(color.purple, 0) :
+     enable_smc_logic and smc_show_candles and is_bearish_ifc ? color.new(color.yellow, 0) :
+     na
+barcolor(smc_bar_color)
+
+// === MAIN DYNAMIC TP CALC ===
+dynamic_tpsl1_for_long_trade  := f_calc_dynamic_tpsl1(true,  active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
+dynamic_tpsl1_for_short_trade := f_calc_dynamic_tpsl1(false, active_lr_high, active_lr_low, active_lr_height, swing_high_candidate, swing_low_candidate)
+
+// === ACTIVE TRADE MANAGEMENT ===
+if strategy.position_size != 0
+    // LONGS
+    if strategy.position_size > 0
+        // 1) Primary SL
+        if low <= active_sl_level
+            string close_payload_sl = f_build_close_payload(active_trade_id, "Stop Loss Hit")
+            strategy.close(active_trade_id, comment="SL Hit", alert_message=close_payload_sl)
+            is_smc_trade := false
+            smc_tp1_hit  := false
+            if enable_sl_reversals
+                float slr_entry = close
+                float slr_sl    = slr_entry + (atr_val * slr_sl_multiplier_atr)
+                float slr_tp    = slr_entry - (atr_val * slr_tp_multiplier_atr)
+                float slr_qty   = f_calc_position_size(slr_entry, slr_sl)
+                if not na(slr_qty) and slr_qty > 0
+                    string slr_payload = f_build_signal_payload("SL Reversal", "SHORT", slr_entry, slr_tp, slr_sl)
+                    strategy.entry("LRA SLR Short", strategy.short, qty=slr_qty, alert_message=slr_payload)
+                    active_trade_id   := "LRA SLR Short"
+                    active_tp_level   := slr_tp
+                    active_sl_level   := slr_sl
+                    trail_sl_price    := na
+                    was_rsi_over      := false
+                    entry_signal_text := "SELL"
+                    entry_signal_price := slr_entry
+        else
+            // --- SMC-SPECIFIC EXIT LOGIC (TP1 / TP2) ---
+            if is_smc_trade
+                // TP2 full close
+                if high >= smc_tp2
+                    string close_payload_smc2 = f_build_close_payload(active_trade_id, "SMC TP2 Hit")
+                    strategy.close(active_trade_id, comment="SMC TP2", alert_message=close_payload_smc2)
+                    is_smc_trade := false
+                    smc_tp1_hit  := false
+                // TP1 partial (50%) + move SL to BE
+                else if not smc_tp1_hit and high >= smc_tp1 and low > active_sl_level
+                    string close_payload_tp1 = f_build_close_payload(active_trade_id, "SMC TP1 (50% Partial)")
+                    strategy.close(active_trade_id, qty_percent=50, comment="SMC TP1 Partial", alert_message=close_payload_tp1)
+                    float be_price = strategy.opentrades.entry_price(0)
+                    trail_sl_price := be_price
+                    smc_tp1_hit    := true
+                // If still in trade after TP checks, fall through to TSL / RSI
+                else if use_trailing_stop
+                    bool tsl_activation_condition = high > strategy.opentrades.entry_price(0) + atr_val
+                    if tsl_activation_condition or not na(trail_sl_price)
+                        float new_trail_sl = high - (tsl_atr_val * tsl_atr_multiplier)
+                        trail_sl_price := na(trail_sl_price) ? new_trail_sl : math.max(trail_sl_price, new_trail_sl)
+                        if low <= trail_sl_price
+                            string close_payload_tsl = f_build_close_payload(active_trade_id, "Trailing Stop Hit")
+                            strategy.close(active_trade_id, comment="TSL Hit", alert_message=close_payload_tsl)
+                else if use_rsi_exit
+                    if rsi_val > rsi_overbought
+                        was_rsi_over := true
+                    if was_rsi_over and rsi_crossed_down_exit_level
+                        string close_payload_rsi = f_build_close_payload(active_trade_id, "RSI Exit")
+                        strategy.close(active_trade_id, comment="RSI Exit", alert_message=close_payload_rsi)
+            // --- NON-SMC EXIT LOGIC (original) ---
+            else
+                if high >= active_tp_level
+                    string close_payload = f_build_close_payload(active_trade_id, "Initial TP Hit")
+                    strategy.close(active_trade_id, comment="Initial TP Hit", alert_message=close_payload)
+                else if use_trailing_stop
+                    bool tsl_activation_condition = high > strategy.opentrades.entry_price(0) + atr_val
+                    if tsl_activation_condition or not na(trail_sl_price)
+                        float new_trail_sl = high - (tsl_atr_val * tsl_atr_multiplier)
+                        trail_sl_price := na(trail_sl_price) ? new_trail_sl : math.max(trail_sl_price, new_trail_sl)
+                        if low <= trail_sl_price
+                            string close_payload_tsl = f_build_close_payload(active_trade_id, "Trailing Stop Hit")
+                            strategy.close(active_trade_id, comment="TSL Hit", alert_message=close_payload_tsl)
+                else if use_rsi_exit
+                    if rsi_val > rsi_overbought
+                        was_rsi_over := true
+                    if was_rsi_over and rsi_crossed_down_exit_level
+                        string close_payload_rsi = f_build_close_payload(active_trade_id, "RSI Exit")
+                        strategy.close(active_trade_id, comment="RSI Exit", alert_message=close_payload_rsi)
+
+    // SHORTS
+    else
+        // 1) Primary SL
+        if high >= active_sl_level
+            string close_payload_sl = f_build_close_payload(active_trade_id, "Stop Loss Hit")
+            strategy.close(active_trade_id, comment="SL Hit", alert_message=close_payload_sl)
+            is_smc_trade := false
+            smc_tp1_hit  := false
+            if enable_sl_reversals
+                float slr_entry = close
+                float slr_sl    = slr_entry - (atr_val * slr_sl_multiplier_atr)
+                float slr_tp    = slr_entry + (atr_val * slr_tp_multiplier_atr)
+                float slr_qty   = f_calc_position_size(slr_entry, slr_sl)
+                if not na(slr_qty) and slr_qty > 0
+                    string slr_payload = f_build_signal_payload("SL Reversal", "LONG", slr_entry, slr_tp, slr_sl)
+                    strategy.entry("LRA SLR Long", strategy.long, qty=slr_qty, alert_message=slr_payload)
+                    active_trade_id   := "LRA SLR Long"
+                    active_tp_level   := slr_tp
+                    active_sl_level   := slr_sl
+                    trail_sl_price    := na
+                    was_rsi_over      := false
+                    entry_signal_text := "BUY"
+                    entry_signal_price := slr_entry
+        else
+            // --- SMC SHORT EXIT LOGIC ---
+            if is_smc_trade
+                if low <= smc_tp2
+                    string close_payload_smc2 = f_build_close_payload(active_trade_id, "SMC TP2 Hit")
+                    strategy.close(active_trade_id, comment="SMC TP2", alert_message=close_payload_smc2)
+                    is_smc_trade := false
+                    smc_tp1_hit  := false
+                else if not smc_tp1_hit and low <= smc_tp1 and high < active_sl_level
+                    string close_payload_tp1 = f_build_close_payload(active_trade_id, "SMC TP1 (50% Partial)")
+                    strategy.close(active_trade_id, qty_percent=50, comment="SMC TP1 Partial", alert_message=close_payload_tp1)
+                    float be_price = strategy.opentrades.entry_price(0)
+                    trail_sl_price := be_price
+                    smc_tp1_hit    := true
+                else if use_trailing_stop
+                    bool tsl_activation_condition = low < strategy.opentrades.entry_price(0) - atr_val
+                    if tsl_activation_condition or not na(trail_sl_price)
+                        float new_trail_sl = low + (tsl_atr_val * tsl_atr_multiplier)
+                        trail_sl_price := na(trail_sl_price) ? new_trail_sl : math.min(trail_sl_price, new_trail_sl)
+                        if high >= trail_sl_price
+                            string close_payload_tsl = f_build_close_payload(active_trade_id, "Trailing Stop Hit")
+                            strategy.close(active_trade_id, comment="TSL Hit", alert_message=close_payload_tsl)
+                else if use_rsi_exit
+                    if rsi_val < rsi_oversold
+                        was_rsi_over := true
+                    if was_rsi_over and rsi_crossed_up_exit_level
+                        string close_payload_rsi = f_build_close_payload(active_trade_id, "RSI Exit")
+                        strategy.close(active_trade_id, comment="RSI Exit", alert_message=close_payload_rsi)
+            // --- NON-SMC SHORT EXIT (original) ---
+            else
+                if low <= active_tp_level
+                    string close_payload = f_build_close_payload(active_trade_id, "Initial TP Hit")
+                    strategy.close(active_trade_id, comment="Initial TP Hit", alert_message=close_payload)
+                else if use_trailing_stop
+                    bool tsl_activation_condition = low < strategy.opentrades.entry_price(0) - atr_val
+                    if tsl_activation_condition or not na(trail_sl_price)
+                        float new_trail_sl = low + (tsl_atr_val * tsl_atr_multiplier)
+                        trail_sl_price := na(trail_sl_price) ? new_trail_sl : math.min(trail_sl_price, new_trail_sl)
+                        if high >= trail_sl_price
+                            string close_payload_tsl = f_build_close_payload(active_trade_id, "Trailing Stop Hit")
+                            strategy.close(active_trade_id, comment="TSL Hit", alert_message=close_payload_tsl)
+                else if use_rsi_exit
+                    if rsi_val < rsi_oversold
+                        was_rsi_over := true
+                    if was_rsi_over and rsi_crossed_up_exit_level
+                        string close_payload_rsi = f_build_close_payload(active_trade_id, "RSI Exit")
+                        strategy.close(active_trade_id, comment="RSI Exit", alert_message=close_payload_rsi)
+
+// Reset trade state when flat
+if strategy.position_size == 0
+    active_trade_id   := ""
+    active_tp_level   := na
+    active_sl_level   := na
+    trail_sl_price    := na
+    was_rsi_over      := false
+    is_smc_trade      := false
+    smc_tp1_hit       := false
+    label.delete(entry_label)
+    entry_label       := na
+    entry_signal_text := ""
+    entry_signal_price := na
+
+if strategy.position_size != 0 or not in_potential_lr
+    is_monitoring_fb_up   := false
+    is_monitoring_fb_down := false
+
+// === LR Detection Logic (unchanged) ===
+if not in_potential_lr and strategy.position_size == 0
+    float potential_lr_h = potential_lr_h_candidate
+    float potential_lr_l = potential_lr_l_candidate
+    float potential_lr_height_val = potential_lr_h - potential_lr_l
+    bool is_height_valid = (potential_lr_height_val >= lr_min_height_atr * atr_val) and (potential_lr_height_val <= lr_max_height_atr * atr_val)
+    if is_height_valid and potential_lr_height_val > 0
+        int bars_in_range = 0
+        for i = 0 to lr_min_bars_consolidation - 1
+            if high[i] <= potential_lr_h and low[i] >= potential_lr_l
+                bars_in_range += 1
+        if bars_in_range >= lr_min_bars_consolidation
+            active_lr_high      := potential_lr_h
+            active_lr_low       := potential_lr_l
+            active_lr_height    := potential_lr_height_val
+            active_lr_start_bar := bar_index
+            in_potential_lr     := true
+            plot_lr_h           := active_lr_high
+            plot_lr_l           := active_lr_low
+            plot_lr_start_time  := time[bar_index - active_lr_start_bar + lr_min_bars_consolidation - 1]
+            plot_lr_color       := color.new(color.gray, 70)
+            plot_lr_text        := "Potential LR"
+            new_lr_for_plot     := true
+
+// === LRA ENTRY LOGIC (unchanged, uses session_condition_met) ===
+if in_potential_lr and strategy.opentrades == 0
+    float breakout_margin = lr_breakout_confirmation_atr * atr_val
+    float long_breakout_level  = active_lr_high + breakout_margin
+    float short_breakout_level = active_lr_low  - breakout_margin
+    bool is_std_long_breakout  = close > long_breakout_level
+    bool is_std_short_breakout = close < short_breakout_level
+    bool vol_cond_std_breakout = not use_volume_confirmation or (volume < avg_volume * volume_threshold_factor_std)
+    bool vol_cond_fb_breakout  = not use_volume_confirmation or (volume < avg_volume * volume_threshold_factor_fb)
+
+    if enable_false_breakout_entries and session_condition_met and not na(active_lr_height) and active_lr_height > 0
+        float max_fb_penetration = active_lr_height * (fb_max_penetration_pct_lr / 100)
+
+        // FB up
+        if (high > active_lr_high) and (high <= active_lr_high + max_fb_penetration) and not is_std_long_breakout
+            if not is_monitoring_fb_up
+                is_monitoring_fb_up := true
+                fb_up_trigger_high  := high
+                fb_up_trigger_bar   := bar_index
+        if is_monitoring_fb_up
+            if (bar_index <= fb_up_trigger_bar + fb_return_bars) and (close < active_lr_high) and vol_cond_fb_breakout
+                float entry_price_fb_short = close
+                float sl_price_fb_short    = fb_up_trigger_high + sl_buffer_atr * atr_val
+                float tp_price_fb_short    = active_lr_low
+                float pos_size_fb_short    = f_calc_position_size(entry_price_fb_short, sl_price_fb_short)
+                if not na(pos_size_fb_short) and pos_size_fb_short > 0 and not na(tp_price_fb_short) and tp_price_fb_short < entry_price_fb_short
+                    string alert_payload = f_build_signal_payload("False Breakout", "SHORT", entry_price_fb_short, tp_price_fb_short, sl_price_fb_short)
+                    strategy.entry("LRA FB Short", strategy.short, qty=pos_size_fb_short, alert_message=alert_payload)
+                    active_trade_id   := "LRA FB Short"
+                    active_tp_level   := tp_price_fb_short
+                    active_sl_level   := sl_price_fb_short
+                    sl_price_var      := sl_price_fb_short
+                    tp_price_var      := tp_price_fb_short
+                    trail_sl_price    := na
+                    was_rsi_over      := false
+                    plot_lr_color     := color.new(color.orange, 70)
+                    plot_lr_text      := "FB Resistance LR"
+                    new_lr_for_plot   := true
+                    in_potential_lr   := false
+                    is_monitoring_fb_up := false
+                    entry_signal_text := "SELL"
+                    entry_signal_price := entry_price_fb_short
+            else if (bar_index > fb_up_trigger_bar + fb_return_bars) or is_std_long_breakout
+                is_monitoring_fb_up := false
+
+        // FB down
+        if (low < active_lr_low) and (low >= active_lr_low - max_fb_penetration) and not is_std_short_breakout
+            if not is_monitoring_fb_down
+                is_monitoring_fb_down := true
+                fb_down_trigger_low   := low
+                fb_down_trigger_bar   := bar_index
+        if is_monitoring_fb_down
+            if (bar_index <= fb_down_trigger_bar + fb_return_bars) and (close > active_lr_low) and vol_cond_fb_breakout
+                float entry_price_fb_long = close
+                float sl_price_fb_long    = fb_down_trigger_low - sl_buffer_atr * atr_val
+                float tp_price_fb_long    = active_lr_high
+                float pos_size_fb_long    = f_calc_position_size(entry_price_fb_long, sl_price_fb_long)
+                if not na(pos_size_fb_long) and pos_size_fb_long > 0 and not na(tp_price_fb_long) and tp_price_fb_long > entry_price_fb_long
+                    string alert_payload = f_build_signal_payload("False Breakout", "LONG", entry_price_fb_long, tp_price_fb_long, sl_price_fb_long)
+                    strategy.entry("LRA FB Long", strategy.long, qty=pos_size_fb_long, alert_message=alert_payload)
+                    active_trade_id   := "LRA FB Long"
+                    active_tp_level   := tp_price_fb_long
+                    active_sl_level   := sl_price_fb_long
+                    sl_price_var      := sl_price_fb_long
+                    tp_price_var      := tp_price_fb_long
+                    trail_sl_price    := na
+                    was_rsi_over      := false
+                    plot_lr_color     := color.new(color.aqua, 70)
+                    plot_lr_text      := "FB Support LR"
+                    new_lr_for_plot   := true
+                    in_potential_lr   := false
+                    is_monitoring_fb_down := false
+                    entry_signal_text := "BUY"
+                    entry_signal_price := entry_price_fb_long
+            else if (bar_index > fb_down_trigger_bar + fb_return_bars) or is_std_short_breakout
+                is_monitoring_fb_down := false
+
+    if strategy.opentrades == 0 and in_potential_lr and vol_cond_std_breakout and session_condition_met
+        if is_std_long_breakout and not na(dynamic_tpsl1_for_long_trade)
+            float entry_price_std_long = close
+            float sl_price_std_long    = active_lr_low - sl_buffer_atr * atr_val
+            float tp_price_std_long    = dynamic_tpsl1_for_long_trade
+            if tp_price_std_long > entry_price_std_long
+                float pos_size_std_long = f_calc_position_size(entry_price_std_long, sl_price_std_long)
+                if not na(pos_size_std_long) and pos_size_std_long > 0
+                    string alert_payload = f_build_signal_payload("Standard Breakout", "LONG", entry_price_std_long, tp_price_std_long, sl_price_std_long)
+                    strategy.entry("LRA Std Long", strategy.long, qty=pos_size_std_long, alert_message=alert_payload)
+                    active_trade_id   := "LRA Std Long"
+                    active_tp_level   := tp_price_std_long
+                    active_sl_level   := sl_price_std_long
+                    sl_price_var      := sl_price_std_long
+                    tp_price_var      := tp_price_std_long
+                    trail_sl_price    := na
+                    was_rsi_over      := false
+                    plot_lr_color     := color.new(color.green, 70)
+                    plot_lr_text      := "Support LR"
+                    new_lr_for_plot   := true
+                    in_potential_lr   := false
+                    entry_signal_text := "BUY"
+                    entry_signal_price := entry_price_std_long
+        else if is_std_short_breakout and not na(dynamic_tpsl1_for_short_trade)
+            float entry_price_std_short = close
+            float sl_price_std_short    = active_lr_high + sl_buffer_atr * atr_val
+            float tp_price_std_short    = dynamic_tpsl1_for_short_trade
+            if tp_price_std_short < entry_price_std_short
+                float pos_size_std_short = f_calc_position_size(entry_price_std_short, sl_price_std_short)
+                if not na(pos_size_std_short) and pos_size_std_short > 0
+                    string alert_payload = f_build_signal_payload("Standard Breakout", "SHORT", entry_price_std_short, tp_price_std_short, sl_price_std_short)
+                    strategy.entry("LRA Std Short", strategy.short, qty=pos_size_std_short, alert_message=alert_payload)
+                    active_trade_id   := "LRA Std Short"
+                    active_tp_level   := tp_price_std_short
+                    active_sl_level   := sl_price_std_short
+                    sl_price_var      := sl_price_std_short
+                    tp_price_var      := tp_price_std_short
+                    trail_sl_price    := na
+                    was_rsi_over      := false
+                    plot_lr_color     := color.new(color.red, 70)
+                    plot_lr_text      := "Resistance LR"
+                    new_lr_for_plot   := true
+                    in_potential_lr   := false
+                    entry_signal_text := "SELL"
+                    entry_signal_price := entry_price_std_short
+else if not na(active_lr_start_bar) and (bar_index > active_lr_start_bar + lr_detect_lookback * 2)
+    in_potential_lr := false
+    new_lr_for_plot := false
+    plot_lr_h       := na
+    plot_lr_l       := na
+
+if strategy.position_size == 0
+    sl_price_var := na
+    tp_price_var := na
+if not in_potential_lr
+    dynamic_tpsl1_for_long_trade  := na
+    dynamic_tpsl1_for_short_trade := na
+
+// === SMC ENTRY LOGIC (independent, Option C) ===
+if enable_smc_logic and session_condition_met and strategy.opentrades == 0
+    // Bullish IFC LONG
+    if is_bullish_ifc
+        float smc_sl = low - syminfo.mintick * 10
+        float risk   = close - smc_sl
+        if risk > 0
+            smc_tp1 := close + risk * smc_risk_reward_1
+            smc_tp2 := close + risk * smc_risk_reward_2
+            float smc_qty = f_calc_position_size(close, smc_sl)
+            if not na(smc_qty) and smc_qty > 0
+                string smc_payload = f_build_signal_payload("SMC IFC Long", "LONG", close, smc_tp2, smc_sl)
+                strategy.entry("SMC IFC Long", strategy.long, qty=smc_qty, alert_message=smc_payload)
+                active_trade_id   := "SMC IFC Long"
+                active_tp_level   := smc_tp2
+                active_sl_level   := smc_sl
+                sl_price_var      := smc_sl
+                tp_price_var      := smc_tp2
+                trail_sl_price    := na
+                was_rsi_over      := false
+                is_smc_trade      := true
+                smc_tp1_hit       := false
+                entry_signal_text := "IFC BUY"
+                entry_signal_price := close
+    // Bearish IFC SHORT
+    else if is_bearish_ifc
+        float smc_sl = high + syminfo.mintick * 10
+        float risk   = smc_sl - close
+        if risk > 0
+            smc_tp1 := close - risk * smc_risk_reward_1
+            smc_tp2 := close - risk * smc_risk_reward_2
+            float smc_qty = f_calc_position_size(close, smc_sl)
+            if not na(smc_qty) and smc_qty > 0
+                string smc_payload = f_build_signal_payload("SMC IFC Short", "SHORT", close, smc_tp2, smc_sl)
+                strategy.entry("SMC IFC Short", strategy.short, qty=smc_qty, alert_message=smc_payload)
+                active_trade_id   := "SMC IFC Short"
+                active_tp_level   := smc_tp2
+                active_sl_level   := smc_sl
+                sl_price_var      := smc_sl
+                tp_price_var      := smc_tp2
+                trail_sl_price    := na
+                was_rsi_over      := false
+                is_smc_trade      := true
+                smc_tp1_hit       := false
+                entry_signal_text := "IFC SELL"
+                entry_signal_price := close
+
+// === DASHBOARD PANEL ===
+var table dash = table.new(position.top_right, 2, 6, border_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "LRA Active?", text_color=color.white, bgcolor=color.new(color.gray, 70))
+    table.cell(dash, 1, 0, strategy.position_size != 0 ? "YES" : "NO",
+               text_color=strategy.position_size != 0 ? color.lime : color.red)
+    
+    table.cell(dash, 0, 1, "In LR?", text_color=color.white)
+    table.cell(dash, 1, 1, in_potential_lr ? "YES" : "NO",
+               text_color=in_potential_lr ? color.aqua : color.red)
+
+    table.cell(dash, 0, 2, "IFC Detected?", text_color=color.white)
+    table.cell(dash, 1, 2, ifc_signal_type != "" ? ifc_signal_type : "NO",
+               text_color=ifc_signal_type == "BUY" ? color.lime :
+                         ifc_signal_type == "SELL" ? color.red : color.gray)
+
+    table.cell(dash, 0, 3, "Session Valid?", text_color=color.white)
+    table.cell(dash, 1, 3, session_condition_met ? "YES" : "NO",
+               text_color=session_condition_met ? color.lime : color.red)
+               
+    table.cell(dash, 0, 4, "IFC Entry Enabled?", text_color=color.white)
+    table.cell(dash, 1, 4, enable_ifc_entries ? "YES" : "NO",
+               text_color=enable_ifc_entries ? color.lime : color.red)
+
+    table.cell(dash, 0, 5, "Open Trade Type", text_color=color.white)
+    table.cell(dash, 1, 5, active_trade_id,
+               text_color=color.white)
+
+// === LR BOX PLOTTING (unchanged) ===
+var box lr_display_box = box.new(na, na, na, na, xloc=xloc.bar_time, border_color=na, bgcolor=na, text=na)
+if new_lr_for_plot
+    box.set_lefttop(lr_display_box, plot_lr_start_time, plot_lr_h)
+    box.set_rightbottom(lr_display_box, time, plot_lr_l)
+    box.set_border_color(lr_display_box, plot_lr_color)
+    box.set_bgcolor(lr_display_box, color.new(plot_lr_color, 85))
+    box.set_text(lr_display_box, plot_lr_text)
+    new_lr_for_plot := false
+else if in_potential_lr and not na(lr_display_box)
+    box.set_right(lr_display_box, time)
+else if strategy.position_size == 0 and not in_potential_lr
+    box.set_left(lr_display_box, na)
+
+// === PLOTS ===
+plot(strategy.position_size != 0 ? sl_price_var : na, title="Active SL",  color=color.new(color.red,   0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? tp_price_var : na, title="Initial TP", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 and use_trailing_stop ? trail_sl_price : na, title="Trailing SL", color=color.new(color.orange, 0), style=plot.style_cross, linewidth=2)
+
+// === ENTRY LABELS ===
+if entry_signal_text != "" and not na(entry_signal_price)
+    label.delete(entry_label)
+    label_color = entry_signal_text == "BUY" or entry_signal_text == "IFC BUY" ? color.new(color.lime, 0) : color.new(color.red, 0)
+    label_style = entry_signal_text == "BUY" or entry_signal_text == "IFC BUY" ? label.style_label_up : label.style_label_down
+    entry_label := label.new(bar_index, entry_signal_price,
+         text=entry_signal_text,
+         color=label_color,
+         textcolor=color.white,
+         style=label_style,
+         size=size.small)
+
